@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>INFO 653 Debug Bot</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>INFO 653 Debug Bot</h1>
+    <span>Back-End Web Development &mdash; Node.js · Express · MySQL</span>
+  </div>
+</header>
+
+<div id="chat-container">
+  <div id="messages">
+    <div id="welcome">
+      <strong>Stuck on an error?</strong><br>
+      Paste your error message or describe what's going wrong. I'll help you understand it — not just fix it.
+    </div>
+  </div>
+</div>
+
+<div id="input-area">
+  <textarea id="user-input" placeholder="Describe your error or paste your code..." rows="1"></textarea>
+  <button id="send-btn">Send</button>
+</div>
+
+<script type="module">
+  import { marked } from 'https://esm.sh/marked@13';
+
+  marked.use({ gfm: true });
+
+  // Session ID persists for the browser tab
+  const sessionId = sessionStorage.getItem('sessionId') || crypto.randomUUID();
+  sessionStorage.setItem('sessionId', sessionId);
+
+  // In-memory history for multi-turn context (role/content pairs for Ollama)
+  const history = [];
+
+  const messagesEl = document.getElementById('messages');
+  const inputEl = document.getElementById('user-input');
+  const sendBtn = document.getElementById('send-btn');
+  const welcomeEl = document.getElementById('welcome');
+
+  function appendMessage(role, text) {
+    if (welcomeEl) welcomeEl.remove();
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return div;
+  }
+
+  function addTypingIndicator() {
+    if (welcomeEl) welcomeEl.remove();
+    const div = document.createElement('div');
+    div.className = 'typing-indicator';
+    div.id = 'typing';
+    div.innerHTML = '<span></span><span></span><span></span>';
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function removeTypingIndicator() {
+    document.getElementById('typing')?.remove();
+  }
+
+  // Auto-grow textarea
+  inputEl.addEventListener('input', () => {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+  });
+
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  sendBtn.addEventListener('click', sendMessage);
+
+  function appendFeedbackBar(conversationId) {
+    const bar = document.createElement('div');
+    bar.className = 'feedback-bar';
+    bar.innerHTML = `
+      <span>Did this help?</span>
+      <button data-val="true">👍</button>
+      <button data-val="false">👎</button>
+    `;
+
+    bar.querySelectorAll('button').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const helpful = btn.dataset.val === 'true';
+        bar.querySelectorAll('button').forEach(b => b.disabled = true);
+        btn.classList.add(helpful ? 'selected-yes' : 'selected-no');
+
+        try {
+          await fetch('/api/chat/feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ conversationId, helpful }),
+          });
+        } catch { /* best-effort */ }
+
+        const thanks = document.createElement('span');
+        thanks.className = 'thanks';
+        thanks.textContent = 'Thanks for the feedback!';
+        bar.querySelector('span').replaceWith(thanks);
+        bar.querySelectorAll('button:not(.selected-yes):not(.selected-no)').forEach(b => b.remove());
+      });
+    });
+
+    messagesEl.appendChild(bar);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  async function sendMessage() {
+    const message = inputEl.value.trim();
+    if (!message || sendBtn.disabled) return;
+
+    appendMessage('user', message);
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    sendBtn.disabled = true;
+    addTypingIndicator();
+
+    // Keep last 10 turns in history to avoid token bloat
+    const trimmedHistory = history.slice(-20);
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, sessionId, history: trimmedHistory }),
+      });
+
+      removeTypingIndicator();
+
+      if (!response.ok) {
+        let msg = `HTTP ${response.status}`;
+        try { const err = await response.json(); msg = err.error || msg; } catch {}
+        appendMessage('error-msg', `Error: ${msg}`);
+        return;
+      }
+
+      const botDiv = appendMessage('bot', '');
+      botDiv.classList.add('streaming');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let fullText = '';
+      let conversationId = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.chunk) {
+              fullText += data.chunk;
+              botDiv.innerHTML = marked.parse(fullText);
+              messagesEl.scrollTop = messagesEl.scrollHeight;
+            }
+            if (data.done) {
+              conversationId = data.conversationId;
+              botDiv.classList.remove('streaming');
+              appendFeedbackBar(conversationId);
+            }
+            if (data.error) {
+              botDiv.textContent = `Error: ${data.error}`;
+              botDiv.classList.add('error-msg');
+              botDiv.classList.remove('bot', 'streaming');
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      // Save to history for multi-turn context
+      history.push({ role: 'user', content: message });
+      history.push({ role: 'assistant', content: fullText });
+
+    } catch (err) {
+      removeTypingIndicator();
+      appendMessage('error-msg', `Connection error: ${err.message}`);
+    } finally {
+      sendBtn.disabled = false;
+      inputEl.focus();
+    }
+  }
+</script>
+</body>
+</html>
